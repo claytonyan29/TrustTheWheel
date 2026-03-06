@@ -3,76 +3,184 @@ import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 // ─── localStorage helpers ──────────────────────────────────────────────────
 const LS_TRADES  = "wheeldeskv1_trades";
 const LS_CAPITAL = "wheeldeskv1_capital";
-const LS_APIKEY  = "wheeldeskv1_apikey";
 const LS_FILES   = "wheeldeskv1_files";
 const lsGet = (key, fallback) => { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } };
 const lsSet = (key, val) => { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} };
 
-// ─── AI CSV Parser ─────────────────────────────────────────────────────────
-async function parseCSVWithAI(csvText, apiKey) {
-  const prompt = `You are a financial data parser. Extract all OPTIONS trades from this brokerage CSV export.
-
-For each options trade found, return a JSON object with these exact fields:
-
-- ticker: string (underlying stock symbol, e.g. "AAPL")
-- type: "PUT" or "CALL"
-- strike: number (strike price)
-- expiry: string (YYYY-MM-DD format)
-- contracts: number (number of contracts, always positive)
-- premiumPerContract: number (premium received or paid per contract in dollars, always positive)
-- premiumCollected: number (total premium = premiumPerContract * contracts * 100, always positive)
-- openDate: string (YYYY-MM-DD format, date the position was opened)
-- status: "open" (always set to open on import, user will update)
-- notes: string (any relevant notes, empty string if none)
-
-Rules:
-
-- Only include OPTIONS trades (puts and calls), skip stock/ETF buys/sells, dividends, interest, etc.
-- If a row is selling to open a put or call, include it
-- premiumCollected should always be positive (it's the credit received)
-- If you see OCC option symbols like AAPL250117P00150000, parse them: ticker=AAPL, expiry=2025-01-17, type=PUT, strike=150.00
-- Return ONLY a valid JSON object with two keys:
-  1. "trades": array of trade objects as described above
-  1. "dateRange": object with "earliest" and "latest" keys (YYYY-MM-DD), representing the full date range of ALL rows in the CSV (not just options), so we can track coverage
-- No markdown, no explanation, no backticks
-
-CSV data:
-${csvText.slice(0, 8000)}`;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 4000,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `API error ${response.status}`);
+// ─── CSV Parsing Utilities ─────────────────────────────────────────────────
+function parseCSVLine(line) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === "," && !inQuotes) {
+      result.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
   }
+  result.push(current);
+  return result;
+}
 
-  const data = await response.json();
-  const text = data.content?.find(b => b.type === "text")?.text || "{}";
-  const clean = text.replace(/`json|`/g, "").trim();
-  const parsed = JSON.parse(clean);
+// Convert MM/DD/YYYY or similar to YYYY-MM-DD
+function toISODate(dateStr) {
+  if (!dateStr) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) return dateStr.slice(0, 10);
+  const m = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return `${m[3]}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+  return dateStr;
+}
 
-  const trades = (parsed.trades || []).map(t => ({
-    ...t,
+// Parse OCC option symbol: AAPL250117P00150000 or -AAPL250117P00150000
+function parseOCC(symbol) {
+  const s = (symbol || "").replace(/^-/, "").trim();
+  const m = s.match(/^([A-Z]+)(\d{6})([PC])(\d{8})$/);
+  if (!m) return null;
+  const [, ticker, date, pc, strikePart] = m;
+  const expiry = `20${date.slice(0, 2)}-${date.slice(2, 4)}-${date.slice(4, 6)}`;
+  const strike = parseInt(strikePart, 10) / 1000;
+  const type = pc === "P" ? "PUT" : "CALL";
+  return { ticker, expiry, strike, type };
+}
+
+function dateRange(dates) {
+  const sorted = dates.filter(Boolean).sort();
+  if (!sorted.length) return null;
+  return { earliest: sorted[0], latest: sorted[sorted.length - 1] };
+}
+
+function makeTrade(occ, contracts, premiumCollected, openDate) {
+  const ppc = contracts > 0 ? premiumCollected / (contracts * 100) : 0;
+  return {
     id: Date.now() + Math.random(),
+    ...occ,
+    contracts,
+    premiumPerContract: ppc,
+    premiumCollected,
+    openDate,
+    status: "open",
     realizedPnl: null,
     closeDate: null,
-    status: "open",
-  }));
+    notes: "",
+  };
+}
 
-  return { trades, dateRange: parsed.dateRange || null };
+// ─── Fidelity CSV Parser ───────────────────────────────────────────────────
+// Expected columns: Run Date, Action, Symbol, Description, Type,
+//                   Quantity, Price, Commission, Fees, Accrued Interest, Amount, Settlement Date
+function parseFidelityCSV(text) {
+  const lines = text.split(/\r?\n/);
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes("Run Date") && lines[i].includes("Action")) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx === -1) return null; // not a Fidelity file
+
+  const headers = parseCSVLine(lines[headerIdx]).map(h => h.trim());
+  const trades = [];
+  const dates = [];
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cols = parseCSVLine(line);
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = (cols[idx] || "").trim(); });
+
+    const action  = row["Action"] || "";
+    const symbol  = row["Symbol"] || "";
+    const dateStr = toISODate(row["Run Date"] || "");
+    const qty     = parseFloat(row["Quantity"] || "0");
+    const amount  = parseFloat((row["Amount"] || "0").replace(/[$, ]/g, ""));
+
+    if (dateStr) dates.push(dateStr);
+
+    // Selling to open = credit received
+    if (!/SOLD.*OPENING|SELL.*TO.*OPEN/i.test(action)) continue;
+
+    const occ = parseOCC(symbol);
+    if (!occ) continue;
+
+    const contracts = Math.abs(qty);
+    const premiumCollected = Math.abs(amount);
+    trades.push(makeTrade(occ, contracts, premiumCollected, dateStr));
+  }
+
+  return { trades, dateRange: dateRange(dates) };
+}
+
+// ─── Schwab CSV Parser ─────────────────────────────────────────────────────
+// Expected columns: Date, Action, Symbol, Description, Quantity, Price, Fees & Comm, Amount
+// Description format for options: "AAPL 01/17/2025 150.00 P" or OCC symbol in Symbol column
+function parseSchwabCSV(text) {
+  const lines = text.split(/\r?\n/);
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.includes("Action") && l.includes("Symbol") && l.includes("Description") && !l.includes("Run Date")) {
+      headerIdx = i;
+      break;
+    }
+  }
+  if (headerIdx === -1) return null; // not a Schwab file
+
+  const headers = parseCSVLine(lines[headerIdx]).map(h => h.trim());
+  const trades = [];
+  const dates = [];
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cols = parseCSVLine(line);
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = (cols[idx] || "").trim(); });
+
+    const action      = row["Action"] || "";
+    const symbol      = row["Symbol"] || "";
+    const description = row["Description"] || "";
+    const dateStr     = toISODate((row["Date"] || "").split(" as of ")[0].trim());
+    const qty         = parseFloat(row["Quantity"] || "0");
+    const price       = Math.abs(parseFloat(row["Price"] || "0"));
+    const amount      = parseFloat((row["Amount"] || "0").replace(/[$, ]/g, ""));
+
+    if (dateStr) dates.push(dateStr);
+
+    if (!/Sell to Open/i.test(action)) continue;
+
+    // Try OCC symbol first, then description
+    let occ = parseOCC(symbol);
+    if (!occ) {
+      const m = description.match(/^(\w+)\s+(\d{2}\/\d{2}\/\d{4})\s+([\d.]+)\s+([CP])/i);
+      if (m) {
+        const [, ticker, date, strike, pc] = m;
+        occ = {
+          ticker: ticker.toUpperCase(),
+          expiry: toISODate(date),
+          strike: parseFloat(strike),
+          type: pc.toUpperCase() === "P" ? "PUT" : "CALL",
+        };
+      }
+    }
+    if (!occ) continue;
+
+    const contracts = Math.abs(qty);
+    const premiumCollected = amount !== 0 ? Math.abs(amount) : price * contracts * 100;
+    trades.push(makeTrade(occ, contracts, premiumCollected, dateStr));
+  }
+
+  return { trades, dateRange: dateRange(dates) };
+}
+
+function parseCSV(text) {
+  return parseFidelityCSV(text) || parseSchwabCSV(text);
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -108,172 +216,36 @@ const G = {
 const mono = "'IBM Plex Mono', monospace";
 const sans = "'IBM Plex Sans', sans-serif";
 
-// ─── Onboarding Modal ─────────────────────────────────────────────────────
-function OnboardingModal({ onSave }) {
-  const [val, setVal] = useState("");
-  const [error, setError] = useState("");
-
-  const submit = () => {
-    if (!val.startsWith("sk-ant-")) { setError("Key should start with sk-ant-"); return; }
-    onSave(val);
-  };
-
-  return (
-    <div style={{ position: "fixed", inset: 0, background: "#000000ee", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, fontFamily: sans }}>
-      <div style={{ background: G.surface, border: `1px solid ${G.border}`, borderRadius: 12, width: 480, overflow: "hidden" }}>
-
-        {/* Top accent bar */}
-        <div style={{ height: 3, background: `linear-gradient(90deg, ${G.accent}, ${G.blue})` }} />
-
-        <div style={{ padding: "32px 36px" }}>
-          {/* Logo */}
-          <div style={{ fontFamily: mono, fontSize: 16, fontWeight: 700, letterSpacing: "0.2em", color: G.accent, marginBottom: 4 }}>
-            WHEEL<span style={{ color: G.blue }}>.</span>DESK
-          </div>
-          <div style={{ fontSize: 11, color: G.muted, fontFamily: mono, marginBottom: 28 }}>Options Wheel Tracker</div>
-
-          {/* What it does */}
-          <div style={{ marginBottom: 28 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: G.text, marginBottom: 12 }}>Track your wheel strategy in one place</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-              {[
-                ["📂", "Import trades from any broker — Fidelity, Schwab, Tastytrade, IBKR"],
-                ["🤖", "AI reads your CSV automatically, no reformatting needed"],
-                ["📊", "Track premium collected, P&L, return on capital, win rate"],
-                ["💾", "Everything saves locally in your browser — no account needed"],
-              ].map(([icon, text]) => (
-                <div key={text} style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                  <span style={{ fontSize: 14, marginTop: 1 }}>{icon}</span>
-                  <span style={{ fontSize: 12, color: G.muted, lineHeight: 1.5 }}>{text}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Divider */}
-          <div style={{ borderTop: `1px solid ${G.border}`, marginBottom: 24 }} />
-
-          {/* API Key setup */}
-          <div style={{ marginBottom: 8 }}>
-            <div style={{ fontSize: 12, fontWeight: 600, color: G.text, marginBottom: 6 }}>Set up AI import (free)</div>
-            <div style={{ fontSize: 11, color: G.muted, lineHeight: 1.6, marginBottom: 14 }}>
-              The AI parser needs a free Anthropic API key. It costs fractions of a cent per CSV import.
-            </div>
-
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14, background: G.bg, border: `1px solid ${G.border}`, borderRadius: 8, padding: "14px 16px" }}>
-              {[
-                ["1", "Go to", "console.anthropic.com", "https://console.anthropic.com"],
-                ["2", "Create a free account and click", "API Keys → Create Key", null],
-                ["3", "Paste your key below", "", null],
-              ].map(([n, before, highlight, href]) => (
-                <div key={n} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <div style={{ width: 18, height: 18, borderRadius: "50%", background: "#0a1e30", border: `1px solid ${G.blue}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, fontFamily: mono, color: G.blue, flexShrink: 0 }}>{n}</div>
-                  <div style={{ fontSize: 11, color: G.muted }}>
-                    {before}{" "}
-                    {href
-                      ? <a href={href} target="_blank" rel="noreferrer" style={{ color: G.blue, textDecoration: "none" }}>{highlight}</a>
-                      : <span style={{ color: G.text, fontFamily: mono, fontSize: 10 }}>{highlight}</span>
-                    }
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <input
-              type="password"
-              placeholder="sk-ant-api03-..."
-              value={val}
-              onChange={e => { setVal(e.target.value); setError(""); }}
-              onKeyDown={e => e.key === "Enter" && submit()}
-              style={{ width: "100%", background: G.bg, border: `1px solid ${error ? G.red : G.border}`, color: G.text, padding: "10px 12px", borderRadius: 6, fontSize: 12, fontFamily: mono, outline: "none", marginBottom: 6 }}
-            />
-            {error && <div style={{ fontSize: 10, color: G.red, fontFamily: mono, marginBottom: 8 }}>{error}</div>}
-          </div>
-
-          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
-            <button
-              onClick={() => onSave("__skip__")}
-              style={{ flex: 1, padding: "10px", border: `1px solid ${G.border}`, background: "none", color: G.muted, borderRadius: 6, fontSize: 11, fontFamily: mono, cursor: "pointer" }}
-            >Skip for now</button>
-            <button
-              onClick={submit}
-              style={{ flex: 2, padding: "10px", border: `1px solid ${G.accent}`, background: "#0a2a1a", color: G.accent, borderRadius: 6, fontSize: 11, fontFamily: mono, cursor: "pointer", fontWeight: 600, letterSpacing: "0.06em" }}
-            >Save Key &amp; Get Started →</button>
-          </div>
-          <div style={{ fontSize: 9.5, color: G.muted, fontFamily: mono, marginTop: 10, textAlign: "center", opacity: 0.7 }}>
-            Your key is stored only in your browser. We never see it.
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── API Key Banner (header) ───────────────────────────────────────────────
-function ApiKeyBanner({ apiKey, onSave }) {
-  const [val, setVal] = useState("");
-  const [show, setShow] = useState(false);
-
-  if (!show) {
-    return (
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-        <div style={{ fontSize: 9, fontFamily: mono, color: G.muted, letterSpacing: "0.08em" }}>API KEY</div>
-        {apiKey && apiKey !== "__skip__"
-          ? <div style={{ fontSize: 9, fontFamily: mono, color: G.accent }}>●●●●●●●●</div>
-          : <div style={{ fontSize: 9, fontFamily: mono, color: G.amber }}>not set</div>
-        }
-        <button onClick={() => { setShow(true); setVal(""); }} style={{ background: "none", border: "none", color: G.muted, fontSize: 9, fontFamily: mono, cursor: "pointer", textDecoration: "underline" }}>
-          {apiKey && apiKey !== "__skip__" ? "change" : "add"}
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <div style={{ fontSize: 9, fontFamily: mono, color: G.muted }}>NEW KEY</div>
-      <input
-        type="password" placeholder="sk-ant-…" value={val}
-        onChange={e => setVal(e.target.value)}
-        onKeyDown={e => { if (e.key === "Enter") { onSave(val); setShow(false); } if (e.key === "Escape") setShow(false); }}
-        style={{ width: 180, background: G.bg, border: `1px solid ${G.border}`, color: G.text, padding: "4px 8px", borderRadius: 4, fontSize: 11, fontFamily: mono, outline: "none" }}
-        autoFocus
-      />
-      <button onClick={() => { onSave(val); setShow(false); }} style={{ background: "#0a1e30", border: `1px solid ${G.blue}`, color: G.blue, padding: "4px 10px", borderRadius: 4, fontSize: 10, fontFamily: mono, cursor: "pointer" }}>Save</button>
-      <button onClick={() => setShow(false)} style={{ background: "none", border: "none", color: G.muted, fontSize: 11, fontFamily: mono, cursor: "pointer" }}>✕</button>
-    </div>
-  );
-}
-
-// ─── AI Drop Zone ──────────────────────────────────────────────────────────
-function DropZone({ onImport, apiKey }) {
-  const [drag, setDrag]     = useState(false);
-  const [jobs, setJobs]     = useState([]);
+// ─── Drop Zone ─────────────────────────────────────────────────────────────
+function DropZone({ onImport }) {
+  const [drag, setDrag] = useState(false);
+  const [jobs, setJobs] = useState([]);
   const ref = useRef();
 
   const handleFiles = async (files) => {
     if (!files?.length) return;
-    if (!apiKey || apiKey === "__skip__") {
-      setJobs([{ name: "error", status: "error", msg: "Add your Anthropic API key in the header first." }]);
-      return;
-    }
 
     const fileList = Array.from(files);
-    setJobs(fileList.map(f => ({ name: f.name, status: "loading", msg: "Analyzing..." })));
+    setJobs(fileList.map(f => ({ name: f.name, status: "loading", msg: "Parsing…" })));
 
     for (let i = 0; i < fileList.length; i++) {
       const file = fileList[i];
       try {
         const text = await file.text();
-        const { trades, dateRange } = await parseCSVWithAI(text, apiKey);
+        const result = parseCSV(text);
+        if (!result) {
+          setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "error", msg: "Unrecognized format — use Fidelity or Schwab export" } : j));
+          continue;
+        }
+        const { trades, dateRange } = result;
         if (trades.length === 0) {
-          setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "error", msg: "No options trades found." } : j));
+          setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "error", msg: "No options sell-to-open trades found" } : j));
           continue;
         }
         onImport(trades, { name: file.name, dateRange, count: trades.length, importedAt: new Date().toISOString() });
         setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "ok", msg: `${trades.length} trade${trades.length !== 1 ? "s" : ""} imported` } : j));
       } catch (e) {
-        setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "error", msg: e.message || "Error — check API key" } : j));
+        setJobs(p => p.map((j, idx) => idx === i ? { ...j, status: "error", msg: e.message || "Parse error" } : j));
       }
     }
   };
@@ -293,10 +265,10 @@ function DropZone({ onImport, apiKey }) {
       >
         <div style={{ fontSize: 20, opacity: 0.4, marginBottom: 6 }}>{anyLoading ? "⏳" : "📂"}</div>
         <div style={{ fontSize: 11, color: G.muted, fontFamily: mono }}>
-          {anyLoading ? "Analyzing with AI…" : "Drop one or more broker CSVs"}
+          {anyLoading ? "Parsing CSV…" : "Drop one or more broker CSVs"}
         </div>
         <div style={{ fontSize: 9.5, color: G.muted, opacity: 0.5, marginTop: 2, fontFamily: mono }}>
-          {anyLoading ? "This takes a few seconds per file" : "Fidelity · Schwab · Tastytrade · IBKR · any broker"}
+          Fidelity · Schwab
         </div>
         <input ref={ref} type="file" accept=".csv" multiple style={{ display: "none" }} onChange={e => handleFiles(e.target.files)} />
       </div>
@@ -316,7 +288,7 @@ function DropZone({ onImport, apiKey }) {
       )}
 
       <div style={{ marginTop: 8, fontSize: 9, color: G.muted, fontFamily: mono, lineHeight: 1.8, opacity: 0.6 }}>
-        AI reads any broker format automatically. Upload multiple 90-day exports to cover longer periods.
+        Export a 90-day history from Fidelity or Schwab and drop it here. Upload multiple files to cover longer periods.
       </div>
     </div>
   );
@@ -481,21 +453,13 @@ const SEED = [
 export default function App() {
   const [trades,  setTrades]       = useState(() => lsGet(LS_TRADES, SEED));
   const [capital, setCapital]       = useState(() => lsGet(LS_CAPITAL, 50000));
-  const [apiKey,  setApiKey]        = useState(() => lsGet(LS_APIKEY, ""));
   const [importedFiles, setImportedFiles] = useState(() => lsGet(LS_FILES, []));
   const [tab,     setTab]           = useState("open");
   const [closing, setClosing]       = useState(null);
-  const [showOnboarding, setShowOnboarding] = useState(() => !lsGet(LS_APIKEY, ""));
 
   useEffect(() => { lsSet(LS_TRADES,  trades);  }, [trades]);
   useEffect(() => { lsSet(LS_CAPITAL, capital); }, [capital]);
-  useEffect(() => { lsSet(LS_APIKEY,  apiKey);  }, [apiKey]);
   useEffect(() => { lsSet(LS_FILES,   importedFiles); }, [importedFiles]);
-
-  const handleApiKeySave = (key) => {
-    setApiKey(key);
-    setShowOnboarding(false);
-  };
 
   const addTrade     = useCallback(t  => setTrades(p => [t, ...p]), []);
   const importTrades = useCallback((ts, fileMeta) => {
@@ -559,8 +523,6 @@ export default function App() {
             <div style={{ fontSize: 10, color: G.muted, fontFamily: mono, letterSpacing: "0.06em" }}>Options Wheel Tracker</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
-            <ApiKeyBanner apiKey={apiKey} onSave={handleApiKeySave} />
-            <div style={{ width: 1, height: 14, background: G.border }} />
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <div style={{ fontSize: 9.5, color: G.muted, fontFamily: mono }}>CAPITAL BASE</div>
               <input type="number" value={capital} onChange={e => setCapital(parseFloat(e.target.value) || 0)}
@@ -650,13 +612,12 @@ export default function App() {
             {/* Sidebar */}
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
-              {/* AI Import */}
+              {/* CSV Import */}
               <div style={{ background: G.surface, border: `1px solid ${G.border}`, borderRadius: 8, overflow: "hidden" }}>
                 <div style={{ background: G.bg, borderBottom: `1px solid ${G.border}`, padding: "11px 18px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div style={{ fontSize: 9.5, fontWeight: 600, letterSpacing: "0.14em", textTransform: "uppercase", color: G.muted, fontFamily: mono }}>AI Import — Any Broker</div>
-                  <span style={{ fontSize: 9, fontFamily: mono, background: "#0a1e10", color: G.accent, padding: "2px 7px", borderRadius: 10, letterSpacing: "0.06em" }}>AI</span>
+                  <div style={{ fontSize: 9.5, fontWeight: 600, letterSpacing: "0.14em", textTransform: "uppercase", color: G.muted, fontFamily: mono }}>Import — Fidelity / Schwab</div>
                 </div>
-                <DropZone onImport={importTrades} apiKey={apiKey} />
+                <DropZone onImport={importTrades} />
               </div>
 
               {/* File history */}
@@ -696,7 +657,6 @@ export default function App() {
         </div>
       </div>
 
-      {showOnboarding && <OnboardingModal onSave={handleApiKeySave} />}
       {closing && <CloseModal trade={closing} onClose={() => setClosing(null)} onSave={closeTrade} />}
     </>
   );
